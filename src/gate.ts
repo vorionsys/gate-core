@@ -1,6 +1,8 @@
 /**
  * @vorionsys/gate-core — src/gate.ts
- * Deterministic BASIS Gate v1 reference pipeline.
+ * Minimal deterministic BASIS gate pipeline — the embeddable core that emits
+ * canonical decision records. (The full layered Gate v1 runtime is
+ * @vorionsys/basis-gate-runtime; convergence tracked on vorionsys/basis-gate.)
  *
  * Pipeline order (fail-closed by construction):
  *   1. credential check   → deny CREDENTIAL_EXPIRED / CREDENTIAL_REVOKED
@@ -93,12 +95,25 @@ export class GateChain {
   private readonly chain: DecisionRecord[] = [];
   private prevHash = "GENESIS";
 
-  constructor(opts: { policy: PolicyDoc; signer: Signer; now?: () => Date; rng?: () => number }) {
+  constructor(opts: {
+    policy: PolicyDoc;
+    signer: Signer;
+    now?: () => Date;
+    rng?: () => number;
+    /** Continue an existing chain (stateless servers: the client's chain IS the
+     *  session). TRUSTS the caller — run @vorionsys/verify's verifyChain first
+     *  whenever the records crossed a trust boundary. */
+    resume?: readonly DecisionRecord[];
+  }) {
     this.policy = opts.policy;
     this.policyHash = sha256Ref(opts.policy); // hash of the exact doc evaluated
     this.signer = opts.signer;
     this.now = opts.now ?? (() => new Date());
     this.rng = opts.rng ?? Math.random;
+    if (opts.resume?.length) {
+      this.chain.push(...opts.resume);
+      this.prevHash = hashRecord(this.chain[this.chain.length - 1]);
+    }
   }
 
   get records(): readonly DecisionRecord[] { return this.chain; }

@@ -1,7 +1,7 @@
 # @vorionsys/gate-core
 
-> Reference implementation of the BASIS Gate v1 pipeline — deterministic, fail-closed,
-> and every verdict is signed into a hash-linked proof chain.
+> The minimal deterministic BASIS gate engine — fail-closed checks in fixed order,
+> every verdict signed into a hash-linked chain of canonical decision records.
 
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
@@ -47,11 +47,19 @@ disagree with the thing that verifies.
 
 ```
 basis-spec (standard)
-   └── basis-gate (BASIS Gate v1 — the specification this implements)
+   └── basis-gate (Gate v1 spec + layered reference runtime)
          ├── contracts (record schema — @vorionsys/contracts/basis)
-         ├── THIS REPO ◄ (reference gate engine)
+         ├── THIS REPO ◄ (minimal embeddable gate core)
          └── basis-verify (offline proof-chain verification)
 ```
+
+Two gate implementations, one lineage, one record format:
+[`@vorionsys/basis-gate-runtime`](https://www.npmjs.com/package/@vorionsys/basis-gate-runtime)
+is the full reference implementation of the Gate v1 spec (composable layers,
+postures, block/inline/deferred execution); **this package is the minimal core** —
+the fixed fail-closed pipeline for when you want gate semantics in a few kilobytes.
+Converging the runtime's proof output onto the canonical decision-record format is
+tracked publicly on [`basis-gate`](https://github.com/vorionsys/basis-gate/issues).
 
 See it run at [`basis-demo`](https://github.com/vorionsys/basis-demo) — the demo
 imports this exact package; that is the credibility mechanism.

@@ -108,6 +108,21 @@ test("emitted chains verify with @vorionsys/verify (strict)", () => {
   assert.equal(result.records.length, 4);
 });
 
+test("resume continues an existing chain with intact links and verification", () => {
+  const signer = ed25519Signer(ed.utils.randomPrivateKey(), "test-kid");
+  const first = new GateChain({ policy, signer });
+  first.evaluate(activeCtx, read);
+  const esc = first.evaluate(activeCtx, bigPayment);
+
+  const second = new GateChain({ policy, signer, resume: [...first.records] });
+  second.resolveEscalation(esc.id, "deny", activeCtx); // escalation found in resumed records
+  second.evaluate(activeCtx, read);
+
+  const result = verifyChain(second.toChainFile(), second.keysFile(), { strict: true });
+  assert.equal(result.valid, true, JSON.stringify(result.firstFailure));
+  assert.equal(second.records.length, 4);
+});
+
 test("every verdict is single-digit-fast (deterministic-gate claim, generous bound)", () => {
   const gate = newGate();
   for (let i = 0; i < 20; i++) gate.evaluate(activeCtx, read);
