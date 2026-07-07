@@ -26,5 +26,12 @@ jobs:
         run: |
           npm run build
           npm test
-      - name: Publish (tokenless OIDC, provenance)
-        run: npm publish --provenance --access public
+      - name: Publish (tokenless OIDC, provenance; skips if version already on registry)
+        run: |
+          PKG=$(npm pkg get name | tr -d '"')
+          VER=$(npm pkg get version | tr -d '"')
+          if npm view "$PKG@$VER" version >/dev/null 2>&1; then
+            echo "$PKG@$VER already published — skipping (gates above still ran)"
+          else
+            npm publish --provenance --access public
+          fi
