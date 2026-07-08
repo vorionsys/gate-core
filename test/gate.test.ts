@@ -130,6 +130,88 @@ test("generic cap rules — escalate over the tier max, allow at it, fail closed
   );
 });
 
+test("CAPABILITY_NOT_GRANTED — deny when grants are declared and the capability is missing", () => {
+  const p: PolicyDoc = {
+    id: "pol_g", version: "1.0.0",
+    domainAllowlist: ["gov.contracts"],
+    capabilityGrants: { 3: ["contracts.read", "contracts.award"] },
+  };
+  const gate = new GateChain({ policy: p, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const t3 = { ...activeCtx, agent: { ...activeCtx.agent, tier: 3 } };
+  assert.equal(gate.evaluate(t3, { domain: "gov.contracts", capability: "contracts.read", params: {} }).verdict.reason, "WITHIN_AUTHORITY");
+  assert.equal(gate.evaluate(t3, { domain: "gov.contracts", capability: "contracts.novate", params: {} }).verdict.reason, "CAPABILITY_NOT_GRANTED");
+  // tier with no grants entry gets nothing — fail closed
+  assert.equal(gate.evaluate(activeCtx, { domain: "gov.contracts", capability: "contracts.read", params: {} }).verdict.reason, "CAPABILITY_NOT_GRANTED");
+});
+
+test("PARAM_NOT_ALLOWLISTED — deny a prohibited param value, allow listed ones", () => {
+  const p: PolicyDoc = {
+    id: "pol_p", version: "1.0.0",
+    domainAllowlist: ["lending.decisions"],
+    paramAllowlists: [{ capability: "decisions.record", param: "basis", allowed: ["dti", "ltv", "fico"] }],
+  };
+  const gate = new GateChain({ policy: p, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const rec = (basis: string) => ({ domain: "lending.decisions", capability: "decisions.record", params: { basis } });
+  assert.equal(gate.evaluate(activeCtx, rec("dti")).verdict.reason, "WITHIN_AUTHORITY");
+  assert.equal(gate.evaluate(activeCtx, rec("zip-code")).verdict.reason, "PARAM_NOT_ALLOWLISTED");
+});
+
+test("RATE_LIMIT_EXCEEDED — velocity derived from the chain; denies don't count", () => {
+  const p: PolicyDoc = {
+    id: "pol_r", version: "1.0.0",
+    domainAllowlist: ["lending.decisions"],
+    paramAllowlists: [{ capability: "decisions.record", param: "basis", allowed: ["dti", "ltv", "fico"] }],
+    rateLimits: [{ capability: "decisions.record", maxPerWindow: 3, windowMs: 60_000 }],
+  };
+  const gate = new GateChain({ policy: p, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const rec = (basis: string) => ({ domain: "lending.decisions", capability: "decisions.record", params: { basis } });
+  assert.equal(gate.evaluate(activeCtx, rec("dti")).verdict.reason, "WITHIN_AUTHORITY");
+  assert.equal(gate.evaluate(activeCtx, rec("zip-code")).verdict.reason, "PARAM_NOT_ALLOWLISTED"); // deny — must not count
+  assert.equal(gate.evaluate(activeCtx, rec("ltv")).verdict.reason, "WITHIN_AUTHORITY");
+  assert.equal(gate.evaluate(activeCtx, rec("fico")).verdict.reason, "WITHIN_AUTHORITY");
+  assert.equal(gate.evaluate(activeCtx, rec("dti")).verdict.reason, "RATE_LIMIT_EXCEEDED"); // 4th allow attempt in window
+});
+
+test("quorum — non-final approval stays escalate/HUMAN_APPROVED, final flips to allow, closed throws", () => {
+  const p: PolicyDoc = {
+    id: "pol_q", version: "1.0.0",
+    domainAllowlist: ["gov.contracts"],
+    caps: [{ capability: "contracts.award", param: "amountUsd", maxByTier: { 2: 250_000 } }],
+    quorums: [{ capability: "contracts.award", approvalsRequired: 2 }],
+  };
+  const gate = new GateChain({ policy: p, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(activeCtx, { domain: "gov.contracts", capability: "contracts.award", params: { amountUsd: 1_800_000 } });
+  assert.equal(esc.verdict.decision, "escalate");
+
+  const first = gate.resolveEscalation(esc.id, "approve", activeCtx);
+  assert.equal(first.verdict.decision, "escalate"); // 1 of 2 — still pending
+  assert.equal(first.verdict.reason, "HUMAN_APPROVED");
+  assert.equal(first.verdict.linksTo, esc.id);
+
+  const second = gate.resolveEscalation(esc.id, "approve", activeCtx);
+  assert.equal(second.verdict.decision, "allow"); // 2 of 2 — quorate
+  assert.equal(second.verdict.reason, "HUMAN_APPROVED");
+
+  assert.throws(() => gate.resolveEscalation(esc.id, "approve", activeCtx), /already closed/);
+  const result = verifyChain(gate.toChainFile(), gate.keysFile(), { strict: true });
+  assert.equal(result.valid, true, JSON.stringify(result.firstFailure));
+});
+
+test("quorum — a denial closes the escalation immediately", () => {
+  const p: PolicyDoc = {
+    id: "pol_q2", version: "1.0.0",
+    domainAllowlist: ["gov.contracts"],
+    caps: [{ capability: "contracts.award", param: "amountUsd", maxByTier: { 2: 250_000 } }],
+    quorums: [{ capability: "contracts.award", approvalsRequired: 2 }],
+  };
+  const gate = new GateChain({ policy: p, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(activeCtx, { domain: "gov.contracts", capability: "contracts.award", params: { amountUsd: 1_800_000 } });
+  gate.resolveEscalation(esc.id, "approve", activeCtx); // 1 of 2
+  const denial = gate.resolveEscalation(esc.id, "deny", activeCtx);
+  assert.equal(denial.verdict.decision, "deny");
+  assert.throws(() => gate.resolveEscalation(esc.id, "approve", activeCtx), /already closed/);
+});
+
 test("resume continues an existing chain with intact links and verification", () => {
   const signer = ed25519Signer(ed.utils.randomPrivateKey(), "test-kid");
   const first = new GateChain({ policy, signer });
