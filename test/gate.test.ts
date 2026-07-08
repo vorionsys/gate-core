@@ -108,6 +108,28 @@ test("emitted chains verify with @vorionsys/verify (strict)", () => {
   assert.equal(result.records.length, 4);
 });
 
+test("generic cap rules — escalate over the tier max, allow at it, fail closed on unknown tier", () => {
+  const capPolicy: PolicyDoc = {
+    id: "pol_caps",
+    version: "1.0.0",
+    domainAllowlist: ["sec.endpoint"],
+    caps: [{ capability: "endpoint.isolate", param: "hostCount", maxByTier: { 2: 10 } }],
+  };
+  const gate = () => new GateChain({ policy: capPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const isolate = (hostCount: number) => ({ domain: "sec.endpoint", capability: "endpoint.isolate", params: { hostCount } });
+
+  assert.equal(gate().evaluate(activeCtx, isolate(250)).verdict.reason, "TIER_CAP_EXCEEDED");
+  assert.equal(gate().evaluate(activeCtx, isolate(10)).verdict.reason, "WITHIN_AUTHORITY");
+  // tier 0 has no entry in maxByTier → cap 0 → any positive value escalates
+  const t0 = { ...activeCtx, agent: { ...activeCtx.agent, tier: 0 } };
+  assert.equal(gate().evaluate(t0, isolate(1)).verdict.reason, "TIER_CAP_EXCEEDED");
+  // unrelated capability ignores the rule
+  assert.equal(
+    gate().evaluate(activeCtx, { domain: "sec.endpoint", capability: "endpoint.scan", params: { hostCount: 9999 } }).verdict.reason,
+    "WITHIN_AUTHORITY",
+  );
+});
+
 test("resume continues an existing chain with intact links and verification", () => {
   const signer = ed25519Signer(ed.utils.randomPrivateKey(), "test-kid");
   const first = new GateChain({ policy, signer });

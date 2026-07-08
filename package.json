@@ -1,6 +1,6 @@
 {
   "name": "@vorionsys/gate-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Minimal deterministic BASIS gate engine — fail-closed pipeline emitting signed, hash-linked decision records (verify with npx @vorionsys/verify)",
   "type": "module",
   "license": "Apache-2.0",

@@ -34,12 +34,22 @@ ed.etc.sha512Sync = (...m: Uint8Array[]) => sha512(ed.etc.concatBytes(...m));
 
 /* ── policy + inputs ────────────────────────────────────────────────────── */
 
+/** Generic numeric tier cap: escalate when `params[param]` exceeds the agent
+ *  tier's max. A tier absent from maxByTier caps at 0 — fail closed. */
+export interface CapRule {
+  capability: string;
+  param: string;
+  maxByTier: Record<number, number>;
+}
+
 export interface PolicyDoc {
   id: string;
   version: string; // semver
   domainAllowlist: readonly string[];
-  /** Per-tier caps. Only payments cap needed for demo v0; extend later. */
-  tierCaps: Record<number, { paymentUsdMax: number }>;
+  /** Legacy payments-only cap (v0.1.x). Still enforced when present. */
+  tierCaps?: Record<number, { paymentUsdMax: number }>;
+  /** Generic per-capability numeric caps (v0.2+). */
+  caps?: readonly CapRule[];
 }
 
 export interface GateContext {
@@ -143,12 +153,8 @@ export class GateChain {
     else if (!this.policy.domainAllowlist.includes(req.domain)) {
       decision = "deny"; reason = "DOMAIN_NOT_ALLOWLISTED";
     }
-    // 3. tier cap (payments)
-    else if (
-      req.capability === "payments.execute" &&
-      typeof req.params.amountUsd === "number" &&
-      req.params.amountUsd > (this.policy.tierCaps[ctx.agent.tier]?.paymentUsdMax ?? 0)
-    ) {
+    // 3. tier caps — legacy payments field, then generic cap rules
+    else if (this.exceedsTierCap(ctx.agent.tier, req)) {
       decision = "escalate"; reason = "TIER_CAP_EXCEEDED";
     }
     // 4. within authority
@@ -175,6 +181,24 @@ export class GateChain {
   }
 
   /* ── internals ── */
+
+  private exceedsTierCap(tier: number, req: ActionRequest): boolean {
+    const legacy = this.policy.tierCaps;
+    if (
+      legacy &&
+      req.capability === "payments.execute" &&
+      typeof req.params.amountUsd === "number" &&
+      req.params.amountUsd > (legacy[tier]?.paymentUsdMax ?? 0)
+    ) {
+      return true;
+    }
+    for (const rule of this.policy.caps ?? []) {
+      if (rule.capability !== req.capability) continue;
+      const value = req.params[rule.param];
+      if (typeof value === "number" && value > (rule.maxByTier[tier] ?? 0)) return true;
+    }
+    return false;
+  }
 
   private append(
     ctx: GateContext,
