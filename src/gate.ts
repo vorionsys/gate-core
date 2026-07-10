@@ -32,6 +32,7 @@ import {
   type DecisionRecord,
   type ReasonCode,
 } from "@vorionsys/contracts/basis";
+import { classifyCapability, effectiveState, type DegradationPolicy, type DegradationState } from "./degradation.js";
 
 ed.etc.sha512Sync = (...m: Uint8Array[]) => sha512(ed.etc.concatBytes(...m));
 
@@ -86,6 +87,9 @@ export interface PolicyDoc {
   rateLimits?: readonly RateLimit[];
   /** Multi-approval escalations (v0.3+). */
   quorums?: readonly QuorumRule[];
+  /** Multi-level aggressive graceful degradation (v0.4+) — see degradation.ts.
+   *  When present, records are stamped with the EFFECTIVE tier at decision time. */
+  degradation?: DegradationPolicy;
 }
 
 export interface GateContext {
@@ -166,10 +170,20 @@ export class GateChain {
   toChainFile(): ChainFile { return { basisVerify: "1", records: [...this.chain] }; }
   keysFile(): Record<string, string> { return { [this.signer.kid]: this.signer.publicKeyBase64 }; }
 
-  /** Evaluate one action. Deterministic; returns the signed, appended record. */
+  /** Degradation state derived from the current chain (null without a policy). */
+  degradationState(baseTier: number): DegradationState | null {
+    return this.policy.degradation ? effectiveState(this.chain, this.policy.degradation, baseTier) : null;
+  }
+
+  /** Evaluate one action. Deterministic; returns the signed, appended record.
+   *  Under a degradation policy, the record is stamped with the EFFECTIVE tier. */
   evaluate(ctx: GateContext, req: ActionRequest): DecisionRecord {
     const t0 = performance.now();
     const nowIso = this.now().toISOString();
+
+    const state = this.degradationState(ctx.agent.tier);
+    const tier = state ? state.effectiveTier : ctx.agent.tier;
+    const capClass = this.policy.degradation ? classifyCapability(this.policy.degradation, req.capability) : null;
 
     let decision: "allow" | "deny" | "escalate";
     let reason: ReasonCode;
@@ -185,32 +199,41 @@ export class GateChain {
     } else if (expired) {
       decision = "deny"; reason = "CREDENTIAL_EXPIRED";
     }
-    // 2. domain allowlist
+    // 2. circuit breaker — a tripped agent is denied before any other policy runs
+    else if (state && capClass && state.level.breakerFor?.includes(capClass)) {
+      decision = "deny"; reason = "CIRCUIT_BREAKER_OPEN";
+    }
+    // 3. domain allowlist
     else if (!this.policy.domainAllowlist.includes(req.domain)) {
       decision = "deny"; reason = "DOMAIN_NOT_ALLOWLISTED";
     }
-    // 3. per-tier capability grants (only when the policy declares them)
-    else if (this.policy.capabilityGrants && !(this.policy.capabilityGrants[ctx.agent.tier] ?? []).includes(req.capability)) {
+    // 4. per-tier capability grants (at the EFFECTIVE tier)
+    else if (this.policy.capabilityGrants && !(this.policy.capabilityGrants[tier] ?? []).includes(req.capability)) {
       decision = "deny"; reason = "CAPABILITY_NOT_GRANTED";
     }
-    // 4. param-value allowlists
+    // 5. param-value allowlists
     else if (this.violatesParamAllowlist(req)) {
       decision = "deny"; reason = "PARAM_NOT_ALLOWLISTED";
     }
-    // 5. chain-derived velocity caps
+    // 6. chain-derived velocity caps
     else if (this.exceedsRateLimit(req, nowIso)) {
       decision = "deny"; reason = "RATE_LIMIT_EXCEEDED";
     }
-    // 6. tier caps — legacy payments field, then generic cap rules
-    else if (this.exceedsTierCap(ctx.agent.tier, req)) {
+    // 7. degradation-forced escalation — at this level the class needs a human
+    else if (state && capClass && state.level.forceEscalate?.includes(capClass)) {
       decision = "escalate"; reason = "TIER_CAP_EXCEEDED";
     }
-    // 7. within authority
+    // 8. tier caps at the effective tier — legacy payments field, then generic rules
+    else if (this.exceedsTierCap(tier, req)) {
+      decision = "escalate"; reason = "TIER_CAP_EXCEEDED";
+    }
+    // 9. within authority
     else {
       decision = "allow"; reason = "WITHIN_AUTHORITY";
     }
 
-    return this.append(ctx, req, { decision, reason, linksTo: null }, nowIso, t0);
+    const stamped: GateContext = state ? { ...ctx, agent: { ...ctx.agent, tier } } : ctx;
+    return this.append(stamped, req, { decision, reason, linksTo: null }, nowIso, t0);
   }
 
   /** Human resolution of a prior escalation (see header comment).
@@ -245,7 +268,9 @@ export class GateChain {
     }
 
     // action is a copy of the escalated action; paramsHash carried verbatim.
-    return this.appendRaw(ctx, { ...esc.action }, verdict, this.now().toISOString(), t0);
+    const state = this.degradationState(ctx.agent.tier);
+    const stamped: GateContext = state ? { ...ctx, agent: { ...ctx.agent, tier: state.effectiveTier } } : ctx;
+    return this.appendRaw(stamped, { ...esc.action }, verdict, this.now().toISOString(), t0);
   }
 
   /* ── internals ── */

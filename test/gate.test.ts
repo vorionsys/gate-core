@@ -212,6 +212,90 @@ test("quorum — a denial closes the escalation immediately", () => {
   assert.throws(() => gate.resolveEscalation(esc.id, "approve", activeCtx), /already closed/);
 });
 
+/* ── degradation (0.4.0) ────────────────────────────────────────────────── */
+
+const DEG: PolicyDoc["degradation"] = {
+  window: 12,
+  strikeWeights: { read: 1, write: 2, execute: 3 },
+  classify: [
+    { suffix: ".read", class: "read" },
+    { suffix: ".write", class: "write" },
+    { suffix: ".execute", class: "execute" },
+  ],
+  levels: [
+    { minScore: 0, name: "NOMINAL", tierDelta: 0 },
+    { minScore: 2, name: "WATCH", tierDelta: -1 },
+    { minScore: 4, name: "RESTRICTED", tierDelta: -2, forceEscalate: ["execute"] },
+    { minScore: 6, name: "PROBATION", tierDelta: -2, forceEscalate: ["write"], breakerFor: ["execute"] },
+    { minScore: 8, name: "BREAKER", tierDelta: -2, breakerFor: ["write", "execute"] },
+  ],
+  earnBack: { decayPerAllow: 1, halvedAfterLevel: "PROBATION" },
+};
+
+const degPolicy: PolicyDoc = {
+  id: "pol_deg",
+  version: "1.0.0",
+  domainAllowlist: ["ops.ledger"],
+  caps: [{ capability: "ops.execute", param: "amountUsd", maxByTier: { 2: 10_000, 1: 2_500, 0: 0 } }],
+  degradation: DEG,
+};
+
+const degGate = () => new GateChain({ policy: degPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+const readReq = { domain: "ops.ledger", capability: "ops.read", params: {} };
+const offDomainWrite = { domain: "not.allowed", capability: "ops.write", params: {} };
+
+test("degradation — strikes accrue by class and demote the effective tier stamped in records", () => {
+  const gate = degGate();
+  assert.equal(gate.evaluate(activeCtx, readReq).agent.tier, 2); // NOMINAL
+  gate.evaluate(activeCtx, offDomainWrite); // deny, +2 → WATCH
+  const r = gate.evaluate(activeCtx, readReq);
+  assert.equal(r.agent.tier, 1); // effective tier stamped, not base
+  assert.equal(gate.degradationState(2)!.level.name, "NOMINAL"); // the allow decayed 2→1
+});
+
+test("degradation — forced escalation at RESTRICTED for execute-class under any amount", () => {
+  const gate = degGate();
+  gate.evaluate(activeCtx, offDomainWrite); // +2
+  gate.evaluate(activeCtx, offDomainWrite); // +2 → score 4 RESTRICTED
+  const r = gate.evaluate(activeCtx, { domain: "ops.ledger", capability: "ops.execute", params: { amountUsd: 5 } });
+  assert.equal(r.verdict.decision, "escalate");
+  assert.equal(r.verdict.reason, "TIER_CAP_EXCEEDED");
+  assert.equal(r.agent.tier, 0); // tier 2 − 2
+});
+
+test("degradation — breaker denies CIRCUIT_BREAKER_OPEN before other policy; reads still pass", () => {
+  const gate = degGate();
+  for (let i = 0; i < 4; i++) gate.evaluate(activeCtx, offDomainWrite); // +8 → BREAKER
+  assert.equal(gate.degradationState(2)!.level.name, "BREAKER");
+  const w = gate.evaluate(activeCtx, offDomainWrite); // write-class → breaker beats domain check
+  assert.equal(w.verdict.reason, "CIRCUIT_BREAKER_OPEN");
+  const r = gate.evaluate(activeCtx, readReq);
+  assert.equal(r.verdict.decision, "allow"); // read-class exempt
+});
+
+test("degradation — breaker denials accrue nothing; earn-back is halved after touching PROBATION", () => {
+  const gate = degGate();
+  for (let i = 0; i < 4; i++) gate.evaluate(activeCtx, offDomainWrite); // score 8, touched PROBATION+
+  gate.evaluate(activeCtx, offDomainWrite); // CIRCUIT_BREAKER_OPEN — must NOT add strikes
+  assert.equal(gate.degradationState(2)!.score, 8);
+  gate.evaluate(activeCtx, readReq); // allow: halved decay 0.5 → 7.5
+  const s = gate.degradationState(2)!;
+  assert.equal(s.score, 7.5);
+  assert.equal(s.earnBackHalved, true);
+  assert.equal(s.level.name, "PROBATION"); // recovered below 8
+});
+
+test("degradation — chains under degradation verify strictly end-to-end", () => {
+  const gate = degGate();
+  gate.evaluate(activeCtx, offDomainWrite);
+  gate.evaluate(activeCtx, offDomainWrite);
+  const esc = gate.evaluate(activeCtx, { domain: "ops.ledger", capability: "ops.execute", params: { amountUsd: 5 } });
+  gate.resolveEscalation(esc.id, "deny", activeCtx);
+  gate.evaluate(activeCtx, readReq);
+  const result = verifyChain(gate.toChainFile(), gate.keysFile(), { strict: true });
+  assert.equal(result.valid, true, JSON.stringify(result.firstFailure));
+});
+
 test("resume continues an existing chain with intact links and verification", () => {
   const signer = ed25519Signer(ed.utils.randomPrivateKey(), "test-kid");
   const first = new GateChain({ policy, signer });

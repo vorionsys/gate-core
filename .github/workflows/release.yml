@@ -16,10 +16,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'   # ships npm >= 11.5.1 (trusted publishing); do NOT self-update npm — the global update is broken on current runner images (missing bundled sigstore)
           registry-url: 'https://registry.npmjs.org'
-      - name: Update npm (trusted publishing requires npm >= 11.5.1)
-        run: npm install -g npm@latest
       - name: Install
         run: npm install
       - name: Gates
