@@ -280,6 +280,81 @@ test("conditions changed — credential expired while the human decided: vote re
   assert.equal(verifyChain(gate.toChainFile(), gate.keysFile(), { strict: true }).valid, true);
 });
 
+/* ── proof-of-verification (0.6.0): no agent has final say ──────────────── */
+
+const verifPolicy: PolicyDoc = {
+  id: "pol_verif",
+  version: "1.0.0",
+  domainAllowlist: ["ci.pipeline", "release.registry"],
+  capabilityGrants: {
+    2: ["service.build", "tests.run", "release.deploy"], // the working agent
+    3: ["release.attest"], // ONLY the verifier principal may attest
+  },
+  caps: [{ capability: "release.attest", param: "checksPassed", maxByTier: {} }], // attest always escalates → human validates the evidence
+  verificationGates: [
+    { capability: "release.deploy", requiresCapability: "release.attest", withinRecords: 3, humanValidated: true },
+  ],
+};
+const worker: GateContext = { agent: { id: "agt_work_02", tier: 2 }, credential: { id: "cred_w", status: "active", expiresAt: FUTURE } };
+const verifier: GateContext = { agent: { id: "agt_verify_09", tier: 3 }, credential: { id: "cred_v", status: "active", expiresAt: FUTURE } };
+const deploy = { domain: "release.registry", capability: "release.deploy", params: { service: "svc-billing", version: "2.4.1" } };
+const attestParams = { service: "svc-billing", checksPassed: 128, evidenceHash: "sha256:" + "e".repeat(64) };
+const attest = { domain: "ci.pipeline", capability: "release.attest", params: attestParams };
+
+test("VERIFICATION_REQUIRED — deploy denies without an attestation in the chain", () => {
+  const gate = new GateChain({ policy: verifPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  gate.evaluate(worker, { domain: "ci.pipeline", capability: "service.build", params: { service: "svc-billing" } });
+  gate.evaluate(worker, { domain: "ci.pipeline", capability: "tests.run", params: { suite: "full", passed: 128 } });
+  const r = gate.evaluate(worker, deploy);
+  assert.equal(r.verdict.decision, "deny");
+  assert.equal(r.verdict.reason, "VERIFICATION_REQUIRED");
+});
+
+test("self-attestation is structurally impossible — the working tier was never granted it", () => {
+  const gate = new GateChain({ policy: verifPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const r = gate.evaluate(worker, attest);
+  assert.equal(r.verdict.reason, "CAPABILITY_NOT_GRANTED");
+});
+
+test("full loop — attest escalates, human validates the evidence, deploy allows; then the attestation rots", () => {
+  const gate = new GateChain({ policy: verifPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(verifier, attest);
+  assert.equal(esc.verdict.decision, "escalate"); // human must validate the checking
+  const validated = gate.resolveEscalation(esc.id, "approve", verifier, { params: attestParams });
+  assert.equal(validated.verdict.decision, "allow");
+  assert.equal(validated.verdict.reason, "HUMAN_APPROVED");
+
+  const ok = gate.evaluate(worker, deploy);
+  assert.equal(ok.verdict.decision, "allow"); // chain now proves the check
+
+  // freshness: two more records push the attestation out of the 3-record window
+  gate.evaluate(worker, { domain: "ci.pipeline", capability: "service.build", params: { service: "svc-billing", hotfix: true } });
+  gate.evaluate(worker, { domain: "ci.pipeline", capability: "tests.run", params: { suite: "smoke", passed: 12 } });
+  const rotted = gate.evaluate(worker, deploy);
+  assert.equal(rotted.verdict.reason, "VERIFICATION_REQUIRED"); // yesterday's check doesn't cover today's change
+  assert.equal(verifyChain(gate.toChainFile(), gate.keysFile(), { strict: true }).valid, true);
+});
+
+test("human REJECTS the evidence — deploy stays blocked", () => {
+  const gate = new GateChain({ policy: verifPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(verifier, attest);
+  const rejected = gate.resolveEscalation(esc.id, "deny", verifier);
+  assert.equal(rejected.verdict.reason, "HUMAN_DENIED");
+  const r = gate.evaluate(worker, deploy);
+  assert.equal(r.verdict.reason, "VERIFICATION_REQUIRED");
+});
+
+test("humanValidated: false accepts a plain allowed attestation", () => {
+  const p: PolicyDoc = {
+    ...verifPolicy,
+    caps: [], // attest no longer escalates
+    verificationGates: [{ capability: "release.deploy", requiresCapability: "release.attest", humanValidated: false }],
+  };
+  const gate = new GateChain({ policy: p, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  assert.equal(gate.evaluate(verifier, attest).verdict.decision, "allow");
+  assert.equal(gate.evaluate(worker, deploy).verdict.decision, "allow");
+});
+
 /* ── degradation (0.4.0) ────────────────────────────────────────────────── */
 
 const DEG: PolicyDoc["degradation"] = {

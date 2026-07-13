@@ -10,8 +10,9 @@
  *   3. capability grants    → deny CAPABILITY_NOT_GRANTED
  *   4. param allowlists     → deny PARAM_NOT_ALLOWLISTED
  *   5. rate limits (chain-derived) → deny RATE_LIMIT_EXCEEDED
- *   6. tier cap check       → escalate TIER_CAP_EXCEEDED (quorum-aware resolution)
- *   7. otherwise            → allow WITHIN_AUTHORITY
+ *   6. proof-of-verification → deny VERIFICATION_REQUIRED (attestations rot)
+ *   7. tier cap check       → escalate TIER_CAP_EXCEEDED (quorum-aware resolution)
+ *   8. otherwise            → allow WITHIN_AUTHORITY
  *
  * No model, no randomness, no I/O in the decision path. Signing uses
  * @noble/ed25519; canonicalization + hashing are IMPORTED FROM @vorionsys/verify
@@ -97,6 +98,23 @@ export interface PolicyDoc {
   /** Multi-level aggressive graceful degradation (v0.4+) — see degradation.ts.
    *  When present, records are stamped with the EFFECTIVE tier at decision time. */
   degradation?: DegradationPolicy;
+  /** Proof-of-Verification (v0.6+): a gated capability denies
+   *  VERIFICATION_REQUIRED unless the chain carries a fresh ALLOWED record of
+   *  requiresCapability (the attestation) — human-validated when required.
+   *  Freshness is count-based (withinRecords) so attestations rot and replays
+   *  stay time-independent. Pair with capabilityGrants so the working
+   *  principal can never attest its own work. */
+  verificationGates?: readonly VerificationGate[];
+}
+
+export interface VerificationGate {
+  capability: string;
+  requiresCapability: string;
+  /** Trailing-record freshness window; omitted = the whole chain. */
+  withinRecords?: number;
+  /** The attestation must have closed through a human approval
+   *  (reason HUMAN_APPROVED), not a plain allow. */
+  humanValidated?: boolean;
 }
 
 export interface GateContext {
@@ -222,19 +240,23 @@ export class GateChain {
     else if (this.violatesParamAllowlist(req)) {
       decision = "deny"; reason = "PARAM_NOT_ALLOWLISTED";
     }
-    // 6. chain-derived velocity caps
+    // 6. proof-of-verification — no agent has final say on its own work
+    else if (this.missingVerification(req)) {
+      decision = "deny"; reason = "VERIFICATION_REQUIRED";
+    }
+    // 7. chain-derived velocity caps
     else if (this.exceedsRateLimit(req, nowIso)) {
       decision = "deny"; reason = "RATE_LIMIT_EXCEEDED";
     }
-    // 7. degradation-forced escalation — at this level the class needs a human
+    // 8. degradation-forced escalation — at this level the class needs a human
     else if (state && capClass && state.level.forceEscalate?.includes(capClass)) {
       decision = "escalate"; reason = "TIER_CAP_EXCEEDED";
     }
-    // 8. tier caps at the effective tier — legacy payments field, then generic rules
+    // 9. tier caps at the effective tier — legacy payments field, then generic rules
     else if (this.exceedsTierCap(tier, req)) {
       decision = "escalate"; reason = "TIER_CAP_EXCEEDED";
     }
-    // 9. within authority
+    // 10. within authority
     else {
       decision = "allow"; reason = "WITHIN_AUTHORITY";
     }
@@ -337,6 +359,25 @@ export class GateChain {
   }
 
   /* ── internals ── */
+
+  /** True when a verification gate for this capability lacks a fresh, valid
+   *  attestation in the chain. The attestation is itself a chain record —
+   *  evidence-committed via its paramsHash, and (when humanValidated) closed
+   *  through the escalation machinery as allow/HUMAN_APPROVED. */
+  private missingVerification(req: ActionRequest): boolean {
+    for (const rule of this.policy.verificationGates ?? []) {
+      if (rule.capability !== req.capability) continue;
+      const window = rule.withinRecords && rule.withinRecords > 0 ? this.chain.slice(-rule.withinRecords) : this.chain;
+      const attested = window.some(
+        (r) =>
+          r.action.capability === rule.requiresCapability &&
+          r.verdict.decision === "allow" &&
+          (!rule.humanValidated || r.verdict.reason === "HUMAN_APPROVED"),
+      );
+      if (!attested) return true;
+    }
+    return false;
+  }
 
   private violatesParamAllowlist(req: ActionRequest): boolean {
     for (const rule of this.policy.paramAllowlists ?? []) {
