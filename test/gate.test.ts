@@ -212,6 +212,74 @@ test("quorum — a denial closes the escalation immediately", () => {
   assert.throws(() => gate.resolveEscalation(esc.id, "approve", activeCtx), /already closed/);
 });
 
+/* ── approval-conflict (0.5.0): approval is not authority ───────────────── */
+
+const ceilingPolicy: PolicyDoc = {
+  id: "pol_ceiling",
+  version: "1.0.0",
+  domainAllowlist: ["gov.contracts"],
+  caps: [{ capability: "contracts.award", param: "amountUsd", maxByTier: { 2: 250_000 } }],
+  quorums: [{ capability: "contracts.award", approvalsRequired: 2, ceilingParam: "amountUsd", ceilingMax: 1_000_000 }],
+};
+const awardParams = { solicitation: "W91-TEST", amountUsd: 1_800_000 };
+const award = { domain: "gov.contracts", capability: "contracts.award", params: awardParams };
+
+test("approval ceiling — quorate approval still denies above the ceiling, as a linked triple", () => {
+  const gate = new GateChain({ policy: ceilingPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(activeCtx, award);
+  assert.equal(esc.verdict.reason, "TIER_CAP_EXCEEDED");
+
+  const vote1 = gate.resolveEscalation(esc.id, "approve", activeCtx, { params: awardParams });
+  assert.equal(vote1.verdict.decision, "escalate"); // 1 of 2
+
+  const final = gate.resolveEscalation(esc.id, "approve", activeCtx, { params: awardParams });
+  assert.equal(final.verdict.decision, "deny");
+  assert.equal(final.verdict.reason, "APPROVAL_CEILING_EXCEEDED");
+  assert.equal(final.verdict.linksTo, esc.id);
+
+  // the chain carries BOTH the second signed vote and the denial
+  const linked = gate.records.filter((r) => r.verdict.linksTo === esc.id);
+  assert.equal(linked.length, 3); // vote1, vote2, ceiling-deny
+  assert.equal(linked[1].verdict.reason, "HUMAN_APPROVED");
+  assert.throws(() => gate.resolveEscalation(esc.id, "approve", activeCtx, { params: awardParams }), /already closed/);
+  assert.equal(verifyChain(gate.toChainFile(), gate.keysFile(), { strict: true }).valid, true);
+});
+
+test("approval ceiling — approvals at or under the ceiling still allow", () => {
+  const okParams = { solicitation: "W91-TEST", amountUsd: 900_000 };
+  const gate = new GateChain({ policy: ceilingPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(activeCtx, { ...award, params: okParams });
+  gate.resolveEscalation(esc.id, "approve", activeCtx, { params: okParams });
+  const final = gate.resolveEscalation(esc.id, "approve", activeCtx, { params: okParams });
+  assert.equal(final.verdict.decision, "allow");
+  assert.equal(final.verdict.reason, "HUMAN_APPROVED");
+});
+
+test("approval ceiling — params are hash-verified; missing or forged params throw", () => {
+  const gate = new GateChain({ policy: ceilingPolicy, signer: ed25519Signer(ed.utils.randomPrivateKey(), "k") });
+  const esc = gate.evaluate(activeCtx, award);
+  gate.resolveEscalation(esc.id, "approve", activeCtx, { params: awardParams });
+  assert.throws(() => gate.resolveEscalation(esc.id, "approve", activeCtx), /needs the escalated action's raw params/);
+  assert.throws(
+    () => gate.resolveEscalation(esc.id, "approve", activeCtx, { params: { ...awardParams, amountUsd: 900_000 } }),
+    /do not match the escalated action's paramsHash/,
+  );
+});
+
+test("conditions changed — credential expired while the human decided: vote recorded, then denied", () => {
+  const gate = newGate(); // plain policy, quorum 1 default
+  const esc = gate.evaluate(activeCtx, bigPayment);
+  const lapsed = { ...activeCtx, credential: { ...activeCtx.credential, status: "expired" as const } };
+  const final = gate.resolveEscalation(esc.id, "approve", lapsed);
+  assert.equal(final.verdict.decision, "deny");
+  assert.equal(final.verdict.reason, "CREDENTIAL_EXPIRED");
+  const linked = gate.records.filter((r) => r.verdict.linksTo === esc.id);
+  assert.equal(linked.length, 2); // the signed approval vote + the denial
+  assert.equal(linked[0].verdict.reason, "HUMAN_APPROVED");
+  assert.equal(linked[0].verdict.decision, "escalate");
+  assert.equal(verifyChain(gate.toChainFile(), gate.keysFile(), { strict: true }).valid, true);
+});
+
 /* ── degradation (0.4.0) ────────────────────────────────────────────────── */
 
 const DEG: PolicyDoc["degradation"] = {

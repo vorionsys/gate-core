@@ -64,10 +64,17 @@ export interface RateLimit {
 
 /** Escalations of this capability need N human approvals to close. Non-final
  *  approvals are recorded as { decision: "escalate", reason: "HUMAN_APPROVED" }
- *  — signed, linked, and visibly still pending. Any denial closes it. */
+ *  — signed, linked, and visibly still pending. Any denial closes it.
+ *
+ *  ceilingParam/ceilingMax (0.5+): human approval grants permission WITHIN
+ *  policy, never beyond it. If the escalated action's param exceeds the
+ *  ceiling, a quorate approval still ends in APPROVAL_CEILING_EXCEEDED —
+ *  the chain records the signed vote AND the denial. */
 export interface QuorumRule {
   capability: string;
   approvalsRequired: number;
+  ceilingParam?: string;
+  ceilingMax?: number;
 }
 
 export interface PolicyDoc {
@@ -245,7 +252,18 @@ export class GateChain {
    *  approval flips to allow. Any denial closes the escalation immediately.
    *  An escalation is CLOSED once a linked record with decision allow or deny
    *  exists; resolving a closed escalation throws. */
-  resolveEscalation(escalationId: string, resolution: "approve" | "deny", ctx: GateContext): DecisionRecord {
+  resolveEscalation(
+    escalationId: string,
+    resolution: "approve" | "deny",
+    ctx: GateContext,
+    opts: {
+      /** Raw params of the escalated action — REQUIRED when the capability's
+       *  quorum rule declares a ceiling. Verified against the escalation's
+       *  paramsHash before use: the gate will not apply a ceiling to numbers
+       *  that are not provably the escalated ones. */
+      params?: Record<string, unknown>;
+    } = {},
+  ): DecisionRecord {
     const t0 = performance.now();
     const esc = this.chain.find((r) => r.id === escalationId);
     if (!esc) throw new Error(`no escalation record ${escalationId} in chain`);
@@ -255,22 +273,67 @@ export class GateChain {
       throw new Error(`escalation ${escalationId} is already closed`);
     }
 
-    let verdict: { decision: "allow" | "deny" | "escalate"; reason: ReasonCode; linksTo: string };
-    if (resolution === "deny") {
-      verdict = { decision: "deny", reason: "HUMAN_DENIED", linksTo: esc.id };
-    } else {
-      const required = this.policy.quorums?.find((q) => q.capability === esc.action.capability)?.approvalsRequired ?? 1;
-      const priorApprovals = linked.filter((r) => r.verdict.reason === "HUMAN_APPROVED").length;
-      verdict =
-        priorApprovals + 1 >= required
-          ? { decision: "allow", reason: "HUMAN_APPROVED", linksTo: esc.id }
-          : { decision: "escalate", reason: "HUMAN_APPROVED", linksTo: esc.id };
-    }
-
-    // action is a copy of the escalated action; paramsHash carried verbatim.
     const state = this.degradationState(ctx.agent.tier);
     const stamped: GateContext = state ? { ...ctx, agent: { ...ctx.agent, tier: state.effectiveTier } } : ctx;
-    return this.appendRaw(stamped, { ...esc.action }, verdict, this.now().toISOString(), t0);
+    const nowIso = this.now().toISOString();
+
+    if (resolution === "deny") {
+      return this.appendRaw(stamped, { ...esc.action }, { decision: "deny", reason: "HUMAN_DENIED", linksTo: esc.id }, nowIso, t0);
+    }
+
+    const rule = this.policy.quorums?.find((q) => q.capability === esc.action.capability);
+    const required = rule?.approvalsRequired ?? 1;
+    const priorApprovals = linked.filter((r) => r.verdict.reason === "HUMAN_APPROVED").length;
+
+    if (priorApprovals + 1 < required) {
+      // non-final vote — signed, linked, visibly still pending
+      return this.appendRaw(stamped, { ...esc.action }, { decision: "escalate", reason: "HUMAN_APPROVED", linksTo: esc.id }, nowIso, t0);
+    }
+
+    // Final approval: the gate re-checks at RESOLUTION time. Approval is not
+    // authority — a hard constraint still denies, and the chain records both
+    // the signed vote and the denial (a linked triple with the escalation).
+    const conflict = this.resolutionConflict(esc, ctx, rule, opts.params, nowIso);
+    if (conflict) {
+      this.appendRaw(stamped, { ...esc.action }, { decision: "escalate", reason: "HUMAN_APPROVED", linksTo: esc.id }, nowIso, t0);
+      const t1 = performance.now();
+      return this.appendRaw(stamped, { ...esc.action }, { decision: "deny", reason: conflict, linksTo: esc.id }, this.now().toISOString(), t1);
+    }
+
+    return this.appendRaw(stamped, { ...esc.action }, { decision: "allow", reason: "HUMAN_APPROVED", linksTo: esc.id }, nowIso, t0);
+  }
+
+  /** Hard constraints that outrank human approval, checked when the final
+   *  approval lands (conditions may have changed while the human decided). */
+  private resolutionConflict(
+    esc: DecisionRecord,
+    ctx: GateContext,
+    rule: QuorumRule | undefined,
+    params: Record<string, unknown> | undefined,
+    nowIso: string,
+  ): ReasonCode | null {
+    // 1. credential state at resolution time
+    const cred = ctx.credential;
+    if (cred.status === "revoked") return "CREDENTIAL_REVOKED";
+    if (cred.status === "expired" || cred.status === "none" || (cred.expiresAt !== null && cred.expiresAt <= nowIso)) {
+      return "CREDENTIAL_EXPIRED";
+    }
+    // 2. circuit breaker at resolution time
+    const state = this.degradationState(ctx.agent.tier);
+    if (state && this.policy.degradation) {
+      const capClass = classifyCapability(this.policy.degradation, esc.action.capability);
+      if (state.level.breakerFor?.includes(capClass)) return "CIRCUIT_BREAKER_OPEN";
+    }
+    // 3. approval ceiling — verified against the escalation's paramsHash
+    if (rule?.ceilingParam !== undefined && rule.ceilingMax !== undefined) {
+      if (!params) throw new Error("this capability's quorum rule has a ceiling — resolveEscalation needs the escalated action's raw params");
+      if (sha256Ref(params) !== esc.action.paramsHash) {
+        throw new Error("provided params do not match the escalated action's paramsHash");
+      }
+      const v = params[rule.ceilingParam];
+      if (typeof v === "number" && v > rule.ceilingMax) return "APPROVAL_CEILING_EXCEEDED";
+    }
+    return null;
   }
 
   /* ── internals ── */
