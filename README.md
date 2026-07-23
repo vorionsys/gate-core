@@ -5,6 +5,13 @@
 
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
+> **What this is:** an *implementation*, not a specification. gate-core is a minimal
+> deterministic engine that produces BASIS-family (RFC-0002) proof chains using
+> [`@vorionsys/contracts`](https://github.com/vorionsys/contracts) types, verifiable with
+> [`@vorionsys/verify`](https://www.npmjs.com/package/@vorionsys/verify). The standard lives in
+> [`basis-spec`](https://github.com/vorionsys/basis-spec); the pipeline companion spec in
+> [`basis-gate`](https://github.com/vorionsys/basis-gate).
+
 ## Use
 
 ```ts
