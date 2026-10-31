@@ -5,14 +5,16 @@
  * @vorionsys/basis-gate-runtime; convergence tracked on vorionsys/basis-gate.)
  *
  * Pipeline order (fail-closed by construction — all denies precede escalate):
- *   1. credential check     → deny CREDENTIAL_EXPIRED / CREDENTIAL_REVOKED
- *   2. domain allowlist     → deny DOMAIN_NOT_ALLOWLISTED
- *   3. capability grants    → deny CAPABILITY_NOT_GRANTED
- *   4. param allowlists     → deny PARAM_NOT_ALLOWLISTED
- *   5. rate limits (chain-derived) → deny RATE_LIMIT_EXCEEDED
- *   6. proof-of-verification → deny VERIFICATION_REQUIRED (attestations rot)
- *   7. tier cap check       → escalate TIER_CAP_EXCEEDED (quorum-aware resolution)
- *   8. otherwise            → allow WITHIN_AUTHORITY
+ *   1. credential check            → deny CREDENTIAL_REVOKED, else CREDENTIAL_EXPIRED
+ *   2. circuit breaker             → deny CIRCUIT_BREAKER_OPEN
+ *   3. domain allowlist            → deny DOMAIN_NOT_ALLOWLISTED
+ *   4. capability grants           → deny CAPABILITY_NOT_GRANTED
+ *   5. param allowlists            → deny PARAM_NOT_ALLOWLISTED
+ *   6. proof-of-verification       → deny VERIFICATION_REQUIRED
+ *   7. rate limits (chain-derived) → deny RATE_LIMIT_EXCEEDED
+ *   8. degradation force-escalate  → escalate TIER_CAP_EXCEEDED
+ *   9. tier cap check              → escalate TIER_CAP_EXCEEDED
+ *  10. otherwise                   → allow WITHIN_AUTHORITY
  *
  * No model, no randomness, no I/O in the decision path. Signing uses
  * @noble/ed25519; canonicalization + hashing are IMPORTED FROM @vorionsys/verify
