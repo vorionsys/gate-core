@@ -102,4 +102,4 @@ There is no lockfile in this repo. `npm install` resolves the ranges in `package
 
 ## License
 
-Apache-2.0. Copyright 2026 Vorion Systems. See [LICENSE](LICENSE).
+Apache-2.0. Copyright 2026 Vorion LLC. See [LICENSE](LICENSE).
